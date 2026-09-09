@@ -88,20 +88,13 @@ TerminalClient::TerminalClient(
       if (connection->connect()) {
         connection->writePacket(
             Packet(EtPacketType::INITIAL_PAYLOAD, protoToString(payload)));
-        fd_set rfd;
-        timeval tv;
         for (int a = 0; a < 3; a++) {
-          FD_ZERO(&rfd);
           int clientFd = connection->getSocketFd();
           if (clientFd < 0) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
             continue;
           }
-          FD_SET(clientFd, &rfd);
-          tv.tv_sec = 1;
-          tv.tv_usec = 0;
-          select(clientFd + 1, &rfd, NULL, NULL, &tv);
-          if (FD_ISSET(clientFd, &rfd)) {
+          if (waitOnSocketData(clientFd)) {
             Packet initialResponsePacket;
             if (connection->readPacket(&initialResponsePacket)) {
               if (initialResponsePacket.getHeader() !=
@@ -198,57 +191,109 @@ void TerminalClient::run(const string& command, const bool noexit) {
         break;
       }
     }
-    // Data structures needed for select() and
-    // non-blocking I/O.
-    fd_set rfd, wfd;
-    timeval tv;
-
-    FD_ZERO(&rfd);
-    FD_ZERO(&wfd);
-    int maxfd = -1;
     int consoleFd = -1;
     if (console && !consoleInputDisabled) {
       consoleFd = console->getFd();
-      maxfd = consoleFd;
+    }
+    const bool consoleWritable = console && consoleOut.hasPendingData();
+    const int clientFd = connection->getSocketFd();
+    const bool watchClient =
+        clientFd > 0 && consoleOut.size() < WriteBuffer::FLUSH_THRESHOLD;
+    // Include port forward sockets for low-latency forwarding.
+    set<int> pfFds;
+    portForwardHandler->getForwardFds(&pfFds);
+
+    set<int> readyFds;
+#ifdef WIN32
+    fd_set rfd, wfd;
+    FD_ZERO(&rfd);
+    FD_ZERO(&wfd);
+    int maxfd = -1;
+    if (consoleFd >= 0) {
       FD_SET(consoleFd, &rfd);
-#ifndef WIN32
-      // PseudoTerminalConsole writes to stdout and reads keystrokes from
-      // stdin. FakeConsole (tests) uses one pipe for both; selecting the
-      // process stdin there races an always-ready EOF and disables input.
-      if (consoleFd == STDOUT_FILENO) {
-        FD_SET(STDIN_FILENO, &rfd);
-        maxfd = max(maxfd, STDIN_FILENO);
-      }
-#endif
+      maxfd = consoleFd;
     }
-    if (console && consoleOut.hasPendingData()) {
-      int outFd = console->getFd();
-      FD_SET(outFd, &wfd);
-      maxfd = max(maxfd, outFd);
+    if (consoleWritable) {
+      FD_SET(console->getFd(), &wfd);
+      maxfd = max(maxfd, console->getFd());
     }
-    int clientFd = connection->getSocketFd();
-    if (clientFd > 0 && consoleOut.size() < WriteBuffer::FLUSH_THRESHOLD) {
+    if (watchClient) {
       FD_SET(clientFd, &rfd);
       maxfd = max(maxfd, clientFd);
     }
-    // Include port forward sockets in select for low-latency forwarding.
-    set<int> pfFds;
-    portForwardHandler->getForwardFds(&pfFds);
     for (int fd : pfFds) {
       FD_SET(fd, &rfd);
       maxfd = max(maxfd, fd);
     }
+    timeval tv;
     tv.tv_sec = 0;
     tv.tv_usec = 10000;
     select(maxfd + 1, &rfd, &wfd, NULL, &tv);
+    if (consoleFd >= 0 && FD_ISSET(consoleFd, &rfd)) {
+      readyFds.insert(consoleFd);
+    }
+    if (watchClient && FD_ISSET(clientFd, &rfd)) {
+      readyFds.insert(clientFd);
+    }
+    for (int fd : pfFds) {
+      if (FD_ISSET(fd, &rfd)) {
+        readyFds.insert(fd);
+      }
+    }
+#else
+    // poll() has no FD_SETSIZE ceiling, and unlike epoll it accepts the
+    // regular file nohup(1) leaves on the console descriptor.
+    vector<struct pollfd> pollFds;
+    // The console read and write descriptors are the same fd, so interest is
+    // merged rather than appended.
+    auto watch = [&pollFds](int fd, short events) {
+      for (auto& pollFd : pollFds) {
+        if (pollFd.fd == fd) {
+          pollFd.events |= events;
+          return;
+        }
+      }
+      pollFds.push_back({fd, events, 0});
+    };
+    if (consoleFd >= 0) {
+      watch(consoleFd, POLLIN);
+      // PseudoTerminalConsole writes to stdout and reads keystrokes from
+      // stdin. FakeConsole (tests) uses one pipe for both; watching the
+      // process stdin there races an always-ready EOF and disables input.
+      if (consoleFd == STDOUT_FILENO) {
+        watch(STDIN_FILENO, POLLIN);
+      }
+    }
+    if (consoleWritable) {
+      // Only needs to wake the loop; the drain below re-checks writability.
+      watch(console->getFd(), POLLOUT);
+    }
+    if (watchClient) {
+      watch(clientFd, POLLIN);
+    }
+    for (int fd : pfFds) {
+      watch(fd, POLLIN);
+    }
+    const int pollResult =
+        poll(pollFds.data(), static_cast<nfds_t>(pollFds.size()), 10);
+    if (pollResult < 0 && errno != EINTR) {
+      FATAL_FAIL(pollResult);
+    }
+    for (const auto& pollFd : pollFds) {
+      if ((pollFd.events & POLLIN) != 0 &&
+          (pollFd.revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL)) != 0) {
+        readyFds.insert(pollFd.fd);
+      }
+    }
+#endif
 
     try {
       bool skipServerRead = false;
       if (console && consoleFd >= 0) {
-        bool inputReady = FD_ISSET(consoleFd, &rfd);
+        bool inputReady = readyFds.count(consoleFd) != 0;
 #ifndef WIN32
         if (consoleFd == STDOUT_FILENO) {
-          inputReady = inputReady || FD_ISSET(STDIN_FILENO, &rfd);
+          inputReady = inputReady || readyFds.count(STDIN_FILENO) != 0;
         }
 #endif
         if (inputReady) {
@@ -293,7 +338,8 @@ void TerminalClient::run(const string& command, const bool noexit) {
 #else
           if (console) {
             int readFd = consoleFd;
-            if (consoleFd == STDOUT_FILENO && FD_ISSET(STDIN_FILENO, &rfd)) {
+            if (consoleFd == STDOUT_FILENO &&
+                readyFds.count(STDIN_FILENO) != 0) {
               readFd = STDIN_FILENO;
             }
             int rc = ::read(readFd, b, BUF_SIZE);
@@ -343,7 +389,7 @@ void TerminalClient::run(const string& command, const bool noexit) {
         }
       }
 
-      if (!skipServerRead && clientFd > 0 && FD_ISSET(clientFd, &rfd)) {
+      if (!skipServerRead && clientFd > 0 && readyFds.count(clientFd) != 0) {
         VLOG(4) << "Clientfd is selected";
         // Cap how much we pull from the server so Ctrl+C can be handled
         // before megabytes of flood are painted. Sequence numbers are
@@ -433,7 +479,13 @@ void TerminalClient::run(const string& command, const bool noexit) {
 
       vector<PortForwardDestinationRequest> requests;
       vector<PortForwardData> dataToSend;
+#ifdef WIN32
+      // select() silently drops descriptors past FD_SETSIZE, so readiness is
+      // not authoritative here and every handler has to be checked.
       portForwardHandler->update(&requests, &dataToSend);
+#else
+      portForwardHandler->update(&requests, &dataToSend, &readyFds);
+#endif
       for (auto& pfr : requests) {
         connection->writePacket(
             Packet(TerminalPacketType::PORT_FORWARD_DESTINATION_REQUEST,

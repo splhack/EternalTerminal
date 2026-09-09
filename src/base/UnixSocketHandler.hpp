@@ -13,9 +13,7 @@ class UnixSocketHandler : public SocketHandler {
   UnixSocketHandler();
   virtual ~UnixSocketHandler() {}
 
-  /**
-   * @brief Blocks with select() until the fd becomes readable.
-   */
+  /** @brief Blocks until the fd becomes readable or the timeout expires. */
   virtual bool waitForData(int fd, int64_t sec, int64_t usec);
   /** @brief Queries whether the descriptor currently has readable bytes. */
   virtual bool hasData(int fd);

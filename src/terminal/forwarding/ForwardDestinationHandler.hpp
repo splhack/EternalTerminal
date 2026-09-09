@@ -18,8 +18,10 @@ class ForwardDestinationHandler {
   /** @brief Sends bytes that need to travel to the destination socket. */
   void write(const string& s);
 
-  /** @brief Polls for incoming data to send back to the source. */
-  void update(vector<PortForwardData>* retval);
+  /** @brief Polls for incoming data to send back to the source. Does nothing
+   * unless `readyFds` names this handler's fd; `nullptr` always polls. */
+  void update(vector<PortForwardData>* retval,
+              const set<int>* readyFds = nullptr);
 
   /** @brief Closes the destination socket and marks the handler inactive. */
   void close();

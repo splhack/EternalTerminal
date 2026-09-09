@@ -339,6 +339,59 @@ TEST_CASE("ForwardSourceHandler update ignores transient EAGAIN reads",
   REQUIRE(socketHandler->closedFds.empty());
 }
 
+TEST_CASE("ForwardSourceHandler update reads only ready fds",
+          "[ForwardSourceHandler]") {
+  auto socketHandler = std::make_shared<MockSocketHandler>();
+  socketHandler->setEndpointFds({100});
+  socketHandler->enqueueAccept(42);
+
+  SocketEndpoint source;
+  source.set_name("localhost");
+  source.set_port(8080);
+  SocketEndpoint destination;
+  destination.set_name("remote");
+  destination.set_port(9090);
+  ForwardSourceHandler handler(socketHandler, source, destination);
+
+  int fd = handler.listen();
+  handler.addSocket(123, fd);
+  socketHandler->enqueueHasData(true);
+  socketHandler->enqueueRead(4, "data");
+  socketHandler->enqueueHasData(false);
+
+  std::vector<PortForwardData> data;
+  set<int> readyFds;
+  handler.update(&data, &readyFds);
+  CHECK(data.empty());
+
+  readyFds.insert(fd);
+  handler.update(&data, &readyFds);
+  REQUIRE(data.size() == 1);
+  CHECK(data[0].buffer() == "data");
+}
+
+TEST_CASE("ForwardSourceHandler listens only on ready fds",
+          "[ForwardSourceHandler]") {
+  auto socketHandler = std::make_shared<MockSocketHandler>();
+  socketHandler->setEndpointFds({100});
+  socketHandler->enqueueAccept(42);
+
+  SocketEndpoint source;
+  source.set_name("localhost");
+  source.set_port(8080);
+  SocketEndpoint destination;
+  destination.set_name("remote");
+  destination.set_port(9090);
+  ForwardSourceHandler handler(socketHandler, source, destination);
+
+  set<int> readyFds;
+  CHECK(handler.listen(&readyFds) == -1);
+  CHECK(socketHandler->acceptCallFds.empty());
+
+  readyFds.insert(100);
+  CHECK(handler.listen(&readyFds) == 42);
+}
+
 TEST_CASE("ForwardSourceHandler sendDataOnSocket writes to socket",
           "[ForwardSourceHandler]") {
   auto socketHandler = std::make_shared<MockSocketHandler>();
@@ -362,7 +415,7 @@ TEST_CASE("ForwardSourceHandler sendDataOnSocket writes to socket",
   REQUIRE(socketHandler->writes[0] == "test data");
 }
 
-TEST_CASE("ForwardSourceHandler getActiveFds returns all fd types",
+TEST_CASE("ForwardSourceHandler getActiveFds excludes unassigned fds",
           "[ForwardSourceHandler]") {
   auto socketHandler = std::make_shared<MockSocketHandler>();
   socketHandler->setEndpointFds({100, 101});
@@ -377,25 +430,22 @@ TEST_CASE("ForwardSourceHandler getActiveFds returns all fd types",
   destination.set_port(9090);
   ForwardSourceHandler handler(socketHandler, source, destination);
 
-  // Accept two connections: assign one, leave other unassigned
-  int fd1 = handler.listen();
-  REQUIRE(fd1 == 42);
-  int fd2 = handler.listen();
-  REQUIRE(fd2 == 43);
+  int assignedFd = handler.listen();
+  REQUIRE(assignedFd == 42);
+  int unassignedFd = handler.listen();
+  REQUIRE(unassignedFd == 43);
 
-  handler.addSocket(123, fd1);  // fd1 (42) moves to socketFdMap
+  handler.addSocket(123, assignedFd);
 
-  // fd2 (43) remains in unassignedFds
+  REQUIRE(handler.hasUnassignedFd(unassignedFd));
   set<int> fds;
   handler.getActiveFds(&fds);
 
-  // Should contain: endpoint fds (100, 101), socketFdMap fd (42),
-  // unassigned fd (43)
   CHECK(fds.count(100) == 1);
   CHECK(fds.count(101) == 1);
-  CHECK(fds.count(42) == 1);
-  CHECK(fds.count(43) == 1);
-  CHECK(fds.size() == 4);
+  CHECK(fds.count(assignedFd) == 1);
+  CHECK(fds.count(unassignedFd) == 0);
+  CHECK(fds.size() == 3);
 }
 
 TEST_CASE("ForwardSourceHandler getActiveFds with no sockets",

@@ -59,6 +59,7 @@ struct winsize {
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <paths.h>
+#include <poll.h>
 #include <pthread.h>
 #include <pwd.h>
 #include <resolv.h>
@@ -388,16 +389,18 @@ inline string protoToString(const T& t) {
 /**
  * Wait on a fd to have data available.
  *
- * @return true if the fd has data, or false if the timeout (of 1 second) is
- *   reached or if the call is interrupted by a syscall.
+ * @return true if the fd is readable, or (POSIX only) has hung up, errored, or
+ *   become invalid, so the caller's read reports the condition; false if the
+ *   timeout is reached or the call is interrupted by a syscall.
  */
-inline bool waitOnSocketData(int fd) {
+inline bool waitOnSocketData(int fd, int64_t sec = 1, int64_t usec = 0) {
+#ifdef WIN32
   fd_set fdset;
   FD_ZERO(&fdset);
   FD_SET(fd, &fdset);
   timeval tv;
-  tv.tv_sec = 1;
-  tv.tv_usec = 0;
+  tv.tv_sec = sec;
+  tv.tv_usec = usec;
   VLOG(4) << "Before selecting sockFd";
   const int selectResult = select(fd + 1, &fdset, NULL, NULL, &tv);
   if (selectResult < 0) {
@@ -409,21 +412,36 @@ inline bool waitOnSocketData(int fd) {
     }
   }
   return FD_ISSET(fd, &fdset);
+#else
+  struct pollfd pollFd = {fd, POLLIN, 0};
+  const int timeoutMs = static_cast<int>(sec * 1000 + usec / 1000);
+  const int pollResult = poll(&pollFd, 1, timeoutMs);
+  if (pollResult < 0) {
+    if (errno == EINTR) {
+      return false;
+    } else {
+      FATAL_FAIL(pollResult);
+    }
+  }
+  return pollResult > 0 &&
+         (pollFd.revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL)) != 0;
+#endif
 }
 
 /**
  * Check whether a fd would accept a write right now without blocking.
  *
- * @return true if the fd is writable, or false if its buffer is full or the
- *   check is interrupted by a syscall.
+ * @return true if the fd is writable, or false if its buffer is full, the fd
+ *   was closed under us, or the check is interrupted by a syscall.
  */
-inline bool isSocketWritable(int fd) {
+inline bool isSocketWritable(int fd, int64_t sec = 0, int64_t usec = 0) {
+#ifdef WIN32
   fd_set fdset;
   FD_ZERO(&fdset);
   FD_SET(fd, &fdset);
   timeval tv;
-  tv.tv_sec = 0;
-  tv.tv_usec = 0;
+  tv.tv_sec = sec;
+  tv.tv_usec = usec;
   const int selectResult = select(fd + 1, NULL, &fdset, NULL, &tv);
   if (selectResult < 0) {
     if (errno == EINTR || errno == EBADF || errno == EINVAL) {
@@ -436,6 +454,22 @@ inline bool isSocketWritable(int fd) {
     }
   }
   return FD_ISSET(fd, &fdset);
+#else
+  struct pollfd pollFd = {fd, POLLOUT, 0};
+  const int timeoutMs = static_cast<int>(sec * 1000 + usec / 1000);
+  const int pollResult = poll(&pollFd, 1, timeoutMs);
+  if (pollResult < 0) {
+    if (errno == EINTR) {
+      return false;
+    } else {
+      FATAL_FAIL(pollResult);
+    }
+  }
+  // POLLNVAL is deliberately excluded: an fd closed under us reports "not
+  // writable" here, matching the EBADF handling in the select() branch.
+  return pollResult > 0 &&
+         (pollFd.revents & (POLLOUT | POLLERR | POLLHUP)) != 0;
+#endif
 }
 
 inline string genRandomAlphaNum(int len) {

@@ -14,10 +14,13 @@ PortForwardHandler::PortForwardHandler(
       sessionGid(groupid) {}
 
 void PortForwardHandler::update(vector<PortForwardDestinationRequest>* requests,
-                                vector<PortForwardData>* dataToSend) {
+                                vector<PortForwardData>* dataToSend,
+                                const set<int>* readyFds) {
   for (auto& it : sourceHandlers) {
-    it->update(dataToSend);
-    int fd = it->listen();
+    if (it->update(dataToSend, readyFds)) {
+      ++forwardFdsGeneration;
+    }
+    int fd = it->listen(readyFds);
     if (fd >= 0) {
       PortForwardDestinationRequest pfr;
       *(pfr.mutable_destination()) = it->getDestination();
@@ -27,11 +30,12 @@ void PortForwardHandler::update(vector<PortForwardDestinationRequest>* requests,
   }
 
   for (auto& it : destinationHandlers) {
-    it.second->update(dataToSend);
+    it.second->update(dataToSend, readyFds);
     if (it.second->getFd() == -1) {
       // Kill the handler and don't update the rest: we'll pick
       // them up later
       destinationHandlers.erase(it.first);
+      ++forwardFdsGeneration;
       break;
     }
   }
@@ -79,6 +83,7 @@ PortForwardSourceResponse PortForwardHandler::createSource(
       auto handler = shared_ptr<ForwardSourceHandler>(new ForwardSourceHandler(
           networkSocketHandler, source, pfsr.destination()));
       sourceHandlers.push_back(handler);
+      ++forwardFdsGeneration;
       return PortForwardSourceResponse();
     } else {
 #ifndef WIN32
@@ -93,12 +98,14 @@ PortForwardSourceResponse PortForwardHandler::createSource(
             shared_ptr<ForwardSourceHandler>(new ForwardSourceHandler(
                 pipeSocketHandler, source, pfsr.destination(), true));
         sourceHandlers.push_back(handler);
+        ++forwardFdsGeneration;
         return PortForwardSourceResponse();
       }
 #endif
       auto handler = shared_ptr<ForwardSourceHandler>(new ForwardSourceHandler(
           pipeSocketHandler, source, pfsr.destination()));
       sourceHandlers.push_back(handler);
+      ++forwardFdsGeneration;
       return PortForwardSourceResponse();
     }
   } catch (const std::runtime_error& ex) {
@@ -164,6 +171,7 @@ PortForwardDestinationResponse PortForwardHandler::createDestination(
           shared_ptr<ForwardDestinationHandler>(new ForwardDestinationHandler(
               isTcp ? networkSocketHandler : pipeSocketHandler, fd, socketId));
       pfdresponse.set_socketid(socketId);
+      ++forwardFdsGeneration;
     }
   }
   return pfdresponse;
@@ -185,11 +193,13 @@ void PortForwardHandler::handlePacket(const Packet& packet,
             LOG(INFO) << "Port forward socket closed: " << pwd.socketid();
             it->second->close();
             destinationHandlers.erase(it);
+            ++forwardFdsGeneration;
           } else if (pwd.has_error()) {
             // TODO: Probably need to do something better here
             LOG(INFO) << "Port forward socket errored: " << pwd.socketid();
             it->second->close();
             destinationHandlers.erase(it);
+            ++forwardFdsGeneration;
           } else {
             it->second->write(pwd.buffer());
           }
@@ -257,6 +267,7 @@ void PortForwardHandler::addSourceSocketId(int socketId, int sourceFd) {
     if (it->hasUnassignedFd(sourceFd)) {
       it->addSocket(socketId, sourceFd);
       socketIdSourceHandlerMap[socketId] = it;
+      ++forwardFdsGeneration;
       return;
     }
   }
@@ -273,6 +284,7 @@ void PortForwardHandler::closeSourceSocketId(int socketId) {
   }
   it->second->closeSocket(socketId);
   socketIdSourceHandlerMap.erase(socketId);
+  ++forwardFdsGeneration;
 }
 
 void PortForwardHandler::getForwardFds(set<int>* fds) {

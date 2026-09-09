@@ -6,21 +6,8 @@ namespace et {
 UnixSocketHandler::UnixSocketHandler() {}
 
 bool UnixSocketHandler::waitForData(int fd, int64_t sec, int64_t usec) {
-  fd_set input;
-  FD_ZERO(&input);
-  FD_SET(fd, &input);
-  struct timeval timeout;
-  timeout.tv_sec = sec;
-  timeout.tv_usec = usec;
-  int n = select(fd + 1, &input, NULL, NULL, &timeout);
-  if (n == -1) {
-    // Select timed out or failed.
-    VLOG(4) << "socket select timeout";
+  if (!et::waitOnSocketData(fd, sec, usec)) {
     return false;
-  } else if (n == 0)
-    return false;
-  if (!FD_ISSET(fd, &input)) {
-    STFATAL << "FD_ISSET is false but we should have data by now.";
   }
   VLOG(4) << "socket " << fd << " has data";
   return true;

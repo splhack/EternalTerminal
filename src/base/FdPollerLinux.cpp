@@ -1,0 +1,71 @@
+#ifdef __linux__
+#include <sys/epoll.h>
+
+#include "FdPoller.hpp"
+
+namespace et {
+FdPoller::FdPoller() : pollerFd(epoll_create1(EPOLL_CLOEXEC)) {
+  if (pollerFd < 0) {
+    throw runtime_error(string("epoll_create1 failed: ") + strerror(errno));
+  }
+}
+
+FdPoller::Ready FdPoller::waitImpl(int capacity, int timeoutMs) {
+  vector<epoll_event> events(capacity);
+  int count = epoll_wait(pollerFd, events.data(), capacity, timeoutMs);
+  if (count < 0) {
+    if (errno == EINTR) {
+      return {};
+    }
+    throw runtime_error(string("epoll_wait failed: ") + strerror(errno));
+  }
+
+  Ready ready;
+  for (int i = 0; i < count; ++i) {
+    const int fd = events[i].data.fd;
+    const uint32_t reported = events[i].events;
+    // EPOLLHUP and EPOLLERR arrive unrequested, so report them only in the
+    // direction the caller asked about.
+    auto it = registeredFds.find(fd);
+    const short interest =
+        it == registeredFds.end() ? kRead | kWrite : it->second;
+    if ((interest & kRead) != 0 &&
+        (reported & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR)) != 0) {
+      ready.readable.insert(fd);
+    }
+    if ((interest & kWrite) != 0 &&
+        (reported & (EPOLLOUT | EPOLLHUP | EPOLLERR)) != 0) {
+      ready.writable.insert(fd);
+    }
+  }
+  return ready;
+}
+
+bool FdPoller::addFd(int fd, short interest) {
+  epoll_event event = {};
+  if ((interest & kRead) != 0) {
+    event.events |= EPOLLIN | EPOLLRDHUP;
+  }
+  if ((interest & kWrite) != 0) {
+    event.events |= EPOLLOUT;
+  }
+  event.data.fd = fd;
+  if (epoll_ctl(pollerFd, EPOLL_CTL_ADD, fd, &event) < 0) {
+    if (errno == EBADF) {
+      return false;
+    }
+    throw runtime_error(string("epoll_ctl add failed: ") + strerror(errno));
+  }
+  return true;
+}
+
+// epoll keys the interest list by descriptor, so one delete clears both
+// directions.
+void FdPoller::removeFd(int fd, short) {
+  if (epoll_ctl(pollerFd, EPOLL_CTL_DEL, fd, nullptr) < 0 && errno != EBADF &&
+      errno != ENOENT) {
+    throw runtime_error(string("epoll_ctl delete failed: ") + strerror(errno));
+  }
+}
+}  // namespace et
+#endif
