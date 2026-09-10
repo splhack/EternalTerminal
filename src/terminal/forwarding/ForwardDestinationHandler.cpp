@@ -12,8 +12,12 @@ void ForwardDestinationHandler::write(const string& s) {
   socketHandler->writeAllOrReturn(fd, s.c_str(), s.length());
 }
 
-void ForwardDestinationHandler::update(vector<PortForwardData>* retval) {
+void ForwardDestinationHandler::update(vector<PortForwardData>* retval,
+                                       const set<int>* readyFds) {
   if (fd == -1) {
+    return;
+  }
+  if (readyFds != nullptr && readyFds->count(fd) == 0) {
     return;
   }
 

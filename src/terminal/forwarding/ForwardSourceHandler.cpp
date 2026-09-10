@@ -16,9 +16,11 @@ ForwardSourceHandler::~ForwardSourceHandler() {
   socketHandler->stopListening(source);
 }
 
-int ForwardSourceHandler::listen() {
-  // TODO: Replace with select
+int ForwardSourceHandler::listen(const set<int>* readyFds) {
   for (int i : socketHandler->getEndpointFds(source)) {
+    if (readyFds != nullptr && readyFds->count(i) == 0) {
+      continue;
+    }
     int fd = socketHandler->accept(i);
     if (fd > -1) {
       LOG(INFO) << "Tunnel " << source << " -> " << destination
@@ -30,12 +32,16 @@ int ForwardSourceHandler::listen() {
   return -1;
 }
 
-void ForwardSourceHandler::update(vector<PortForwardData>* data) {
+bool ForwardSourceHandler::update(vector<PortForwardData>* data,
+                                  const set<int>* readyFds) {
   vector<int> socketsToRemove;
 
   for (auto& it : socketFdMap) {
     int socketId = it.first;
     int fd = it.second;
+    if (readyFds != nullptr && readyFds->count(fd) == 0) {
+      continue;
+    }
 
     while (socketHandler->hasData(fd)) {
       char buf[1024];
@@ -71,6 +77,7 @@ void ForwardSourceHandler::update(vector<PortForwardData>* data) {
   for (auto& it : socketsToRemove) {
     socketFdMap.erase(it);
   }
+  return !socketsToRemove.empty();
 }
 
 bool ForwardSourceHandler::hasUnassignedFd(int fd) {
@@ -103,9 +110,6 @@ void ForwardSourceHandler::getActiveFds(set<int>* fds) {
   }
   for (auto& it : socketFdMap) {
     fds->insert(it.second);
-  }
-  for (int fd : unassignedFds) {
-    fds->insert(fd);
   }
 }
 

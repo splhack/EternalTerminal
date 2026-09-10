@@ -3,6 +3,7 @@
 
 #include <cstdint>
 
+#include "FdPoller.hpp"
 #include "JumphostPending.hpp"
 #include "TelemetryService.hpp"
 #include "TmuxCcFilter.hpp"
@@ -17,13 +18,7 @@ void drainDiscardReadableBytes(int fd, WriteBuffer* buf) {
   char bufBytes[BUF_SIZE];
   bool got = false;
   while (true) {
-    fd_set rfds;
-    FD_ZERO(&rfds);
-    FD_SET(fd, &rfds);
-    timeval tv;
-    tv.tv_sec = 0;
-    tv.tv_usec = 0;
-    if (select(fd + 1, &rfds, NULL, NULL, &tv) <= 0) {
+    if (!waitOnSocketData(fd, 0, 0)) {
       break;
     }
     int rc = ::read(fd, bufBytes, BUF_SIZE);
@@ -136,19 +131,11 @@ TerminalServer::~TerminalServer() {}
 
 void TerminalServer::run() {
   LOG(INFO) << "Creating server";
-  fd_set coreFds;
-  int numCoreFds = 0;
-  int maxCoreFd = 0;
-  FD_ZERO(&coreFds);
   set<int> serverPortFds = socketHandler->getEndpointFds(serverEndpoint);
-  for (int i : serverPortFds) {
-    FD_SET(i, &coreFds);
-    maxCoreFd = max(maxCoreFd, i);
-    numCoreFds++;
-  }
-  FD_SET(terminalRouter->getServerFd(), &coreFds);
-  maxCoreFd = max(maxCoreFd, terminalRouter->getServerFd());
-  numCoreFds++;
+  set<int> coreFds = serverPortFds;
+  coreFds.insert(terminalRouter->getServerFd());
+  FdPoller poller;
+  poller.setFds(coreFds);
 
   if (TelemetryService::exists()) {
     TelemetryService::get()->logToDatadog("Server started", el::Level::Info,
@@ -162,39 +149,17 @@ void TerminalServer::run() {
         break;
       }
     }
-    // Select blocks until there is something useful to do
-    fd_set rfds = coreFds;
-    int numFds = numCoreFds;
-    int maxFd = maxCoreFd;
-    timeval tv;
-
-    if (numFds > FD_SETSIZE) {
-      STFATAL << "Tried to select() on too many FDs";
-    }
-
-    tv.tv_sec = 0;
-    tv.tv_usec = 100000;
-
-    const int numFdsSet = select(maxFd + 1, &rfds, NULL, NULL, &tv);
-    if (numFdsSet < 0 && errno == EINTR) {
-      // If EINTR was returned, then the syscall was interrupted by a signal.
-      // This is not an error, but can be a signal that the program is being
-      // shutdown, so restart the loop to check for the halt condition.
+    set<int> readyFds = poller.wait(100).readable;
+    if (readyFds.empty()) {
       continue;
     }
 
-    FATAL_FAIL(numFdsSet);
-    if (numFdsSet == 0) {
-      continue;
-    }
-
-    // We have something to do!
     for (int i : serverPortFds) {
-      if (FD_ISSET(i, &rfds)) {
+      if (readyFds.count(i) != 0) {
         acceptNewConnection(i);
       }
     }
-    if (FD_ISSET(terminalRouter->getServerFd(), &rfds)) {
+    if (readyFds.count(terminalRouter->getServerFd()) != 0) {
       auto idKeyPair = terminalRouter->acceptNewConnection();
       if (idKeyPair.id.length()) {
         addClientKey(idKeyPair.id, idKeyPair.key);
@@ -234,6 +199,7 @@ void TerminalServer::runJumpHost(
 
   shared_ptr<SocketHandler> terminalSocketHandler =
       terminalRouter->getSocketHandler();
+  FdPoller poller;
 
   terminalSocketHandler->writePacket(
       terminalFd,
@@ -251,12 +217,9 @@ void TerminalServer::runJumpHost(
       }
     }
 
-    fd_set rfd, wfd;
-    timeval tv;
-
-    FD_ZERO(&rfd);
-    FD_ZERO(&wfd);
-    int maxfd = -1;
+    set<int> readFds;
+    set<int> writeFds;
+    set<int> refreshFds;
     int serverClientFd = serverClientState->getSocketFd();
     const bool connected = serverClientFd > 0;
     // Connected: bound the userspace queue. Disconnected: keep today's
@@ -265,28 +228,27 @@ void TerminalServer::runJumpHost(
                             ? pending.canAcceptMore()
                             : serverClientState->canBufferWrite(2 * BUF_SIZE);
     if (readTerminal && !holdDroppableForClient) {
-      FD_SET(terminalFd, &rfd);
-      maxfd = terminalFd;
+      readFds.insert(terminalFd);
     }
     if (connected) {
       getSocketHandler()->minimizeKernelBuffering(serverClientFd);
-      FD_SET(serverClientFd, &rfd);
-      maxfd = max(maxfd, serverClientFd);
+      readFds.insert(serverClientFd);
+      // A reconnect can hand back the same fd number for a new socket.
+      refreshFds.insert(serverClientFd);
       if (!pending.empty() && !holdDroppableForClient) {
-        FD_SET(serverClientFd, &wfd);
+        writeFds.insert(serverClientFd);
       }
     }
-    tv.tv_sec = 0;
-    tv.tv_usec = 100000;
-    if (select(maxfd + 1, &rfd, &wfd, NULL, &tv) < 0 && errno == EINTR) {
-      continue;
-    }
+    poller.setFds(readFds, writeFds, refreshFds);
+    // Write readiness only needs to wake the loop; the drain below re-checks
+    // it per write.
+    const set<int> readyFds = poller.wait(100).readable;
 
     try {
       // Read client input before draining, so Ctrl+C can drop the backlog
       // instead of losing the race to a writable socket.
-      if (serverClientFd > 0 && FD_ISSET(serverClientFd, &rfd)) {
-        VLOG(4) << "Jumphost is selected";
+      if (serverClientFd > 0 && readyFds.count(serverClientFd) != 0) {
+        VLOG(4) << "Jumphost socket is ready";
         if (serverClientState->hasData()) {
           VLOG(4) << "Jumphost serverClientState has data";
           Packet packet;
@@ -335,7 +297,7 @@ void TerminalServer::runJumpHost(
             serverClientState.get(), stillConnected ? serverClientFd : -1);
       }
 
-      if (FD_ISSET(terminalFd, &rfd)) {
+      if (readyFds.count(terminalFd) != 0) {
         try {
           Packet packet;
           if (terminalSocketHandler->readPacket(terminalFd, &packet)) {
@@ -430,6 +392,8 @@ void TerminalServer::runTerminal(
   int terminalFd = userInfo.fd();
   shared_ptr<SocketHandler> terminalSocketHandler =
       terminalRouter->getSocketHandler();
+  FdPoller poller;
+  uint64_t forwardFdsGeneration = portForwardHandler->getForwardFdsGeneration();
 
   TermInit termInit;
   for (auto& it : environmentVariables) {
@@ -452,14 +416,9 @@ void TerminalServer::runTerminal(
       }
     }
 
-    // Data structures needed for select() and
-    // non-blocking I/O.
-    fd_set rfd, wfd;
-    timeval tv;
-
-    FD_ZERO(&rfd);
-    FD_ZERO(&wfd);
-    int maxfd = -1;
+    set<int> readFds;
+    set<int> writeFds;
+    set<int> refreshFds;
     int serverClientFd = serverClientState->getSocketFd();
     const bool connected = serverClientFd > 0;
     // Connected: stage in WriteBuffer (16MB cap). Disconnected: today's
@@ -469,38 +428,41 @@ void TerminalServer::runTerminal(
                             ? terminalOutputBuffer.canAcceptMore()
                             : serverClientState->canBufferWrite(2 * BUF_SIZE);
     if (readTerminal && !holdDroppableForClient) {
-      FD_SET(terminalFd, &rfd);
-      maxfd = terminalFd;
+      readFds.insert(terminalFd);
     }
     if (connected) {
       // Reapply every iteration: reconnect replaces the socket, kernel
       // tuning is per-socket, and fd numbers are reused.
       serverSocketHandler->minimizeKernelBuffering(serverClientFd);
-      FD_SET(serverClientFd, &rfd);
-      maxfd = max(maxfd, serverClientFd);
+      readFds.insert(serverClientFd);
+      refreshFds.insert(serverClientFd);
       if (terminalOutputBuffer.hasPendingData() && !holdDroppableForClient) {
-        FD_SET(serverClientFd, &wfd);
+        writeFds.insert(serverClientFd);
       }
     }
-    // Include port forward sockets in select for low-latency forwarding.
+    // Include port forward sockets for low-latency forwarding.
     set<int> pfFds;
     portForwardHandler->getForwardFds(&pfFds);
-    for (int fd : pfFds) {
-      FD_SET(fd, &rfd);
-      maxfd = max(maxfd, fd);
+    readFds.insert(pfFds.begin(), pfFds.end());
+
+    // Any open or close since the last pass may have recycled an fd number.
+    uint64_t currentForwardFdsGeneration =
+        portForwardHandler->getForwardFdsGeneration();
+    if (currentForwardFdsGeneration != forwardFdsGeneration) {
+      refreshFds.insert(pfFds.begin(), pfFds.end());
+      forwardFdsGeneration = currentForwardFdsGeneration;
     }
-    tv.tv_sec = 0;
-    tv.tv_usec = 100000;
-    if (select(maxfd + 1, &rfd, &wfd, NULL, &tv) < 0 && errno == EINTR) {
-      continue;
-    }
+    poller.setFds(readFds, writeFds, refreshFds);
+    // Write readiness only needs to wake the loop; the drain below re-checks
+    // it per write.
+    const set<int> readyFds = poller.wait(100).readable;
 
     try {
       // Handle client input before draining the output queue. Otherwise a
       // writable socket (fast client, or a client just resumed) sends the
       // whole backlog before Ctrl+C is read, and flushIfLarge sees nothing.
-      if (serverClientFd > 0 && FD_ISSET(serverClientFd, &rfd)) {
-        VLOG(3) << "ServerClientFd is selected";
+      if (serverClientFd > 0 && readyFds.count(serverClientFd) != 0) {
+        VLOG(3) << "ServerClientFd is ready";
         while (serverClientState->hasData()) {
           VLOG(3) << "ServerClientState has data";
           Packet packet;
@@ -585,7 +547,7 @@ void TerminalServer::runTerminal(
       // Check for data to receive; the received
       // data includes also the data previously sent
       // on the same master descriptor (line 90).
-      if (FD_ISSET(terminalFd, &rfd)) {
+      if (readyFds.count(terminalFd) != 0) {
         // Read from terminal and write to client
         memset(b, 0, BUF_SIZE);
         int rc = read(terminalFd, b, BUF_SIZE);
@@ -622,7 +584,7 @@ void TerminalServer::runTerminal(
 
       vector<PortForwardDestinationRequest> requests;
       vector<PortForwardData> dataToSend;
-      portForwardHandler->update(&requests, &dataToSend);
+      portForwardHandler->update(&requests, &dataToSend, &readyFds);
       for (auto& pfr : requests) {
         serverClientState->writePacket(
             Packet(TerminalPacketType::PORT_FORWARD_DESTINATION_REQUEST,
@@ -691,8 +653,14 @@ void TerminalServer::handleConnection(
 bool TerminalServer::newClient(
     shared_ptr<ServerClientConnection> serverClientState) {
   lock_guard<std::mutex> guard(terminalThreadMutex);
-  shared_ptr<thread> t = shared_ptr<thread>(
-      new thread(&TerminalServer::handleConnection, this, serverClientState));
+  auto t = make_shared<thread>([this, serverClientState]() {
+    try {
+      handleConnection(serverClientState);
+    } catch (const std::exception& ex) {
+      LOG(ERROR) << "Terminal thread failed: " << ex.what();
+      removeClient(serverClientState->getId());
+    }
+  });
   terminalThreads.push_back(t);
   return true;
 }

@@ -91,17 +91,8 @@ int TcpSocketHandler::connect(const SocketEndpoint& endpoint) {
       sockFd = -1;
       continue;
     }
-    fd_set fdset;
-    FD_ZERO(&fdset);
-    FD_SET(sockFd, &fdset);
-    timeval tv;
-    tv.tv_sec = 3; /* 3 second timeout */
-    tv.tv_usec = 0;
-    VLOG(4) << "Before selecting sockFd";
-    select(sockFd + 1, NULL, &fdset, NULL, &tv);
-
-    if (FD_ISSET(sockFd, &fdset)) {
-      VLOG(4) << "sockFd " << sockFd << " is selected";
+    if (isSocketWritable(sockFd, 3)) {
+      VLOG(4) << "sockFd " << sockFd << " is writable";
       int so_error;
       socklen_t len = sizeof so_error;
 

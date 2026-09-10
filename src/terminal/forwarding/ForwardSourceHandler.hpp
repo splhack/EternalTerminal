@@ -23,13 +23,16 @@ class ForwardSourceHandler {
 
   ~ForwardSourceHandler();
 
-  /** @brief Starts listening on the source endpoint and returns the server fd.
+  /** @brief Accepts one pending connection and returns its fd, or -1 if none.
+   * Accepts only on endpoints named in `readyFds`; `nullptr` tries every one.
    */
-  int listen();
+  int listen(const set<int>* readyFds = nullptr);
 
-  /** @brief Polls all active sockets and stages `PortForwardData` for
-   * destinations. */
-  void update(vector<PortForwardData>* data);
+  /** @brief Reads the sockets named in `readyFds` (all of them when `nullptr`)
+   * and stages `PortForwardData` for destinations.
+   * @return true if any socket was closed and dropped. */
+  bool update(vector<PortForwardData>* data,
+              const set<int>* readyFds = nullptr);
 
   /** @brief Returns true if an accepted socket is pending assignment. */
   bool hasUnassignedFd(int fd);

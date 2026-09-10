@@ -24,10 +24,12 @@ class PortForwardHandler {
                               shared_ptr<SocketHandler> _pipeSocketHandler,
                               uid_t userid = static_cast<uid_t>(-1),
                               gid_t groupid = static_cast<gid_t>(-1));
-  /** @brief Polls all handlers for new destination/data and sends
-   * `PortForwardData`. */
+  /** @brief Polls handlers and collects destination requests and
+   * `PortForwardData` for the caller to send. Touches only the descriptors
+   * named in `readyFds`; `nullptr` polls every one. */
   void update(vector<PortForwardDestinationRequest>* requests,
-              vector<PortForwardData>* dataToSend);
+              vector<PortForwardData>* dataToSend,
+              const set<int>* readyFds = nullptr);
   /** @brief Handles control packets arriving over the SSH connection. */
   void handlePacket(const Packet& packet, shared_ptr<Connection> connection);
   PortForwardSourceResponse createSource(const PortForwardSourceRequest& pfsr,
@@ -49,6 +51,7 @@ class PortForwardHandler {
    * socket. */
   void sendDataToSourceOnSocket(int socketId, const string& data);
   void getForwardFds(set<int>* fds);
+  uint64_t getForwardFdsGeneration() const { return forwardFdsGeneration; }
 
  protected:
   /** @brief Handler used for the SSH/network-facing sockets. */
@@ -67,6 +70,10 @@ class PortForwardHandler {
   /** @brief Maps control socket IDs to their source handlers for routing data.
    */
   unordered_map<int, shared_ptr<ForwardSourceHandler>> socketIdSourceHandlerMap;
+  /** @brief Bumped by every site that opens or closes a descriptor exposed by
+   * `getForwardFds`: a recycled fd number yields an identical set, so this is
+   * a poller's only signal that it must re-register. */
+  uint64_t forwardFdsGeneration = 0;
 };
 }  // namespace et
 

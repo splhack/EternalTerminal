@@ -74,18 +74,12 @@ int PipeSocketHandler::connect(const SocketEndpoint& endpoint) {
     return sockFd;
   }
 
-  fd_set fdset;
-  FD_ZERO(&fdset);
-  FD_SET(sockFd, &fdset);
-  timeval tv;
-  tv.tv_sec = 3; /* 3 second timeout */
-  tv.tv_usec = 0;
-  VLOG(4) << "Before selecting sockFd";
-  int selectResult = select(sockFd + 1, NULL, &fdset, NULL, &tv);
-  VLOG(3) << "AF_UNIX connect select returned " << selectResult;
+  VLOG(4) << "Before waiting on sockFd";
+  const bool writable = isSocketWritable(sockFd, 3 /* 3 second timeout */);
+  VLOG(3) << "AF_UNIX connect wait returned " << writable;
 
-  if (FD_ISSET(sockFd, &fdset)) {
-    VLOG(4) << "sockFd " << sockFd << " is selected";
+  if (writable) {
+    VLOG(4) << "sockFd " << sockFd << " is writable";
     int so_error;
     socklen_t len = sizeof so_error;
 

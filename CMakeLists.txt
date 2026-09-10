@@ -428,6 +428,10 @@ add_library(
   src/base/Connection.cpp
   src/base/CryptoHandler.hpp
   src/base/CryptoHandler.cpp
+  src/base/FdPoller.hpp
+  src/base/FdPoller.cpp
+  src/base/FdPollerKqueue.cpp
+  src/base/FdPollerLinux.cpp
   src/base/ServerClientConnection.hpp
   src/base/ServerClientConnection.cpp
   src/base/ServerConnection.hpp
@@ -609,14 +613,16 @@ if(WIN32)
       ${CMAKE_CURRENT_SOURCE_DIR}/test/unit_tests/*Test.cpp)
 
     # These tests exercise production facilities that do not exist on Windows:
-    # fork/SCM_RIGHTS privilege dropping, Unix server/terminal handlers, or a
-    # POSIX PTY/terminal host. Keep this exclusion list explicit so every new
-    # portable test is included on Windows automatically.
+    # fork/SCM_RIGHTS privilege dropping, Unix server/terminal handlers, a
+    # POSIX PTY/terminal host, or epoll/kqueue readiness polling. Keep this
+    # exclusion list explicit so every new portable test is included on
+    # Windows automatically.
     set(WINDOWS_UNSUPPORTED_TEST_SRCS
       ${CMAKE_CURRENT_SOURCE_DIR}/test/integration_tests/HandleConnectionTimeoutTest.cpp
       ${CMAKE_CURRENT_SOURCE_DIR}/test/integration_tests/JumphostTest.cpp
       ${CMAKE_CURRENT_SOURCE_DIR}/test/integration_tests/TerminalServerTest.cpp
       ${CMAKE_CURRENT_SOURCE_DIR}/test/integration_tests/TerminalTest.cpp
+      ${CMAKE_CURRENT_SOURCE_DIR}/test/unit_tests/FdPollerTest.cpp
       ${CMAKE_CURRENT_SOURCE_DIR}/test/unit_tests/HtmGhosttyE2eTest.cpp
       ${CMAKE_CURRENT_SOURCE_DIR}/test/unit_tests/ServerFifoPathTest.cpp
       ${CMAKE_CURRENT_SOURCE_DIR}/test/unit_tests/UserSocketOpsTest.cpp
